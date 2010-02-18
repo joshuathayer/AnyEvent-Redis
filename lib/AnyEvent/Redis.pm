@@ -24,6 +24,7 @@ sub new {
     bless {
         host => $host,
         port => $port,
+        retry_count => 0,
         %args,
     }, $class;
 }
@@ -31,6 +32,7 @@ sub new {
 sub run_cmd {
     my $self = shift;
     my $cmd  = shift;
+    $self->{cmd} = [$cmd, @_];
 
     $self->{cmd_cb} or return $self->connect($cmd, @_);
     $self->{cmd_cb}->($cmd, @_);
@@ -53,13 +55,28 @@ sub all_cv {
     $self->{all_cv};
 }
 
+sub retry {
+    my $self = shift;
+    warn "RETRY called" if DEBUG;
+
+    if (defined $self->{max_retries}
+        and $self->{retry_count}++ < $self->{max_retries}) {
+
+        $self->all_cv->end;
+        $self->{cmd_cb} = undef;
+        $self->{sock} = undef;
+        $self->run_cmd(@{$self->{cmd}});
+    } else {
+        ($self->{on_error} || sub { die @_ })->($_);
+    }
+}
+
 sub connect {
     my $self = shift;
 
     my $cv;
     if (@_) {
         $cv = AE::cv;
-        push @{$self->{connect_queue}}, [ $cv, @_ ];
     }
 
     return $cv if $self->{sock};
@@ -70,9 +87,11 @@ sub connect {
 
         my $hd = AnyEvent::Handle->new(
             fh => $fh,
-            on_error => sub { $_[0]->destroy },
-            on_eof   => sub { $_[0]->destroy },
+            on_error => sub { $_[0]->destroy; $self->retry; },
+            on_eof   => sub { $_[0]->destroy; $self->retry; },
         );
+
+        $self->{retry_count} = 0;
 
         $self->{cmd_cb} = sub {
             $self->all_cv->begin;
@@ -108,7 +127,7 @@ sub connect {
                     . "\r\n";
             }
 
-            warn $send if DEBUG;
+            warn "$send" if DEBUG;
 
             $cv ||= AE::cv;
             $cv->cb(sub {
@@ -187,10 +206,7 @@ sub connect {
             return $cv;
         };
 
-        for my $queue (@{$self->{connect_queue} || []}) {
-            my($cv, @args) = @$queue;
-            $self->{cmd_cb}->(@args, $cv);
-        }
+        $self->{cmd_cb}->(@{$self->{cmd}}, $cv);
     };
 
     return $cv;
