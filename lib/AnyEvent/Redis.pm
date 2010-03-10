@@ -2,7 +2,7 @@ package AnyEvent::Redis;
 
 use strict;
 use 5.008_001;
-our $VERSION = '0.06';
+our $VERSION = '0.08';
 
 use constant DEBUG => $ENV{ANYEVENT_REDIS_DEBUG};
 use AnyEvent;
@@ -32,6 +32,10 @@ sub run_cmd {
     my $self = shift;
     my $cmd  = shift;
 
+    # if we don't have a real "runner" callback:
+    #    call connect(), which will set up that callback,
+    #     and will run this command,
+    # otherwise: just call the runner with this command
     $self->{cmd_cb} or return $self->connect($cmd, @_);
     $self->{cmd_cb}->($cmd, @_);
 }
@@ -53,10 +57,28 @@ sub all_cv {
     $self->{all_cv};
 }
 
+sub retry {
+    my $self = shift;
+    warn "RETRY called" if DEBUG;
+ 
+    if (defined $self->{max_retries}
+        and $self->{retry_count}++ < $self->{max_retries}) {
+ 
+        $self->all_cv->end;
+        $self->{cmd_cb} = undef;
+        $self->{sock} = undef;
+        $self->run_cmd(@{$self->{inflight}});
+    } else {
+        ($self->{on_error} || sub { die @_ })->($_);
+    }
+}
+
 sub connect {
     my $self = shift;
 
     my $cv;
+
+    # push connection 'request' into queue
     if (@_) {
         $cv = AE::cv;
         push @{$self->{connect_queue}}, [ $cv, @_ ];
@@ -70,12 +92,15 @@ sub connect {
 
         my $hd = AnyEvent::Handle->new(
             fh => $fh,
-            on_error => sub { $_[0]->destroy },
-            on_eof   => sub { $_[0]->destroy },
+            on_error => sub { $_[0]->destroy; $self->retry },
+            on_eof   => sub { $_[0]->destroy; $self->retry },
         );
 
         $self->{cmd_cb} = sub {
             $self->all_cv->begin;
+
+            @{$self->{inflight}} = @_;
+
             my $command = shift;
 
             my($cv, $cb);
@@ -153,6 +178,11 @@ sub connect {
                 } elsif ( $type eq '*' ) {
                     my $size = $result;
                     warn "size is $size" if DEBUG;
+                    if ($result < 0) {
+                        return $cv_send->($cv, undef);
+                    } elsif ($result == 0) {
+                        return $cv_send->($cv, []);
+                    }
                     my @lines;
                     my $multi_cb; $multi_cb = sub {
                         my $hd = shift;
@@ -185,9 +215,9 @@ sub connect {
             });
 
             return $cv;
-        };
+        }; # end defining protocol 
 
-        for my $queue (@{$self->{connect_queue} || []}) {
+        while (my $queue = pop @{ $self->{connect_queue} || [] } ) {
             my($cv, @args) = @$queue;
             $self->{cmd_cb}->(@args, $cv);
         }
